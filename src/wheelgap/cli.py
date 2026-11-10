@@ -731,16 +731,14 @@ def main(argv: list[str] | None = None) -> int:
             args.ios or config.get("ios", DEFAULT_IOS),
             args.android_api or config.get("android-api", DEFAULT_ANDROID_API),
         )
-        index_url = args.index_url
-        if index_url is None:
-            index_url = config.get("index-url")
-            if index_url is not None and "@" in index_url.partition("://")[2].partition("/")[0]:
+        index_url = args.index_url if args.index_url is not None else config.get("index-url")
+        if index_url is not None:
+            _, auth = split_credentials(index_url)
+            if auth is not None and args.index_url is None:
                 raise SourceError(
                     "[tool.wheelgap] index-url must not contain credentials: "
                     "pass the URL with --index-url from a CI secret instead"
                 )
-        if index_url is not None:
-            split_credentials(index_url)
         else:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
         sources = load_inputs(args.inputs or ["."])

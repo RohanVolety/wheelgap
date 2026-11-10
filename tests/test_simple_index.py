@@ -348,6 +348,15 @@ def test_config_index_url_refuses_credentials(fake_simple, tmp_path, capsys):
     assert "s3cret" not in out.out + out.err
 
 
+def test_config_credentials_are_refused_however_the_url_is_spelled(fake_simple, tmp_path, capsys):
+    from wheelgap.cli import main
+
+    # urlsplit drops tabs, so a check on the raw text alone would miss this one.
+    assert main([_project(tmp_path, "https:\\t//user:s3cret@config.example/simple"), "--json"]) == 2
+    assert not fake_simple.calls
+    assert "s3cret" not in "".join(capsys.readouterr())
+
+
 def test_config_index_url_must_be_a_string(tmp_path, capsys):
     from wheelgap.cli import main
 
@@ -373,6 +382,7 @@ def test_range_skips_releases_whose_requires_python_excludes_the_target(fake_sim
     assert fill("pythonranged", spec=">=1", python="3.9").version == "1.0"
     assert fill("pythonranged", spec=">=1", python="3.12").version == "2.0"
     assert fill("pythonranged", spec=">=2", python="3.9").error == "no release matches >=2 for Python 3.9"
+    assert fill("pythonranged", python="3.9").version == "2.0"  # no range: the latest, as fill() does
 
 
 def test_fill_all_passes_the_python_to_the_simple_index(fake_simple):
