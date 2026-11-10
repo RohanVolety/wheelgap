@@ -731,7 +731,14 @@ def main(argv: list[str] | None = None) -> int:
             args.ios or config.get("ios", DEFAULT_IOS),
             args.android_api or config.get("android-api", DEFAULT_ANDROID_API),
         )
-        index_url = args.index_url if args.index_url is not None else config.get("index-url")
+        index_url = args.index_url
+        if index_url is None:
+            index_url = config.get("index-url")
+            if index_url is not None and "@" in index_url.partition("://")[2].partition("/")[0]:
+                raise SourceError(
+                    "[tool.wheelgap] index-url must not contain credentials: "
+                    "pass the URL with --index-url from a CI secret instead"
+                )
         if index_url is not None:
             split_credentials(index_url)
         else:
@@ -763,7 +770,7 @@ def main(argv: list[str] | None = None) -> int:
         return input_error_json(e) if args.json else 2
 
     packages = [p for s in sources for p in s.packages]
-    other_index = fill_all(packages, refresh=args.online, python=single_python(targets),simple_index=index_url)
+    other_index = fill_all(packages, refresh=args.online, python=single_python(targets), simple_index=index_url)
     if args.online and other_index and not quiet:
         print(
             f"wheelgap: note: --online looks up PyPI packages only; kept the locked files of {other_index} "
@@ -786,7 +793,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not other:
                     continue
             else:
-                other, failed = recheck_lock(s.packages,simple_index=index_url)
+                other, failed = recheck_lock(s.packages, simple_index=index_url)
             note = (
                 f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
                 f"wheels for Python {', '.join(outside)}; looked its PyPI packages up on the index too"

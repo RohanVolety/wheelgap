@@ -13,9 +13,9 @@ from wheelgap.sources import Package, SourceError
 BASE = "https://private.example/simple"
 
 
-def fill(name, version=None, spec=None, base=BASE, auth=None):
+def fill(name, version=None, spec=None, base=BASE, auth=None, python=None):
     pkg = Package(name, version, spec=spec)
-    return pypi.fill_simple(pkg, base, auth)
+    return pypi.fill_simple(pkg, base, auth, python)
 
 
 def test_pinned_gets_every_file_of_that_version(fake_simple):
@@ -293,8 +293,8 @@ def serve():
 
 
 def test_real_request_sends_accept_and_basic_auth(serve):
-    base, seen = serve(lambda h: _send(h, pypi.SIMPLE_ACCEPT))
-    _, auth = pypi.split_credentials("http://user:s3cret@x/simple")
+    base, seen = serve(lambda h: _send(h, pypi.SIMPLE_JSON))
+    _, auth = pypi.split_credentials("https://user:s3cret@x/simple")
     assert pypi.fetch_simple(f"{base}/simple/fastlib/", auth)["name"] == "fastlib"
     path, headers = seen[0]
     assert path == "/simple/fastlib/"
@@ -309,7 +309,7 @@ def test_real_html_response_is_rejected_by_content_type(serve):
 
 
 def test_authorization_is_not_forwarded_on_a_redirect(serve):
-    other, other_seen = serve(lambda h: _send(h, pypi.SIMPLE_ACCEPT))
+    other, other_seen = serve(lambda h: _send(h, pypi.SIMPLE_JSON))
     first, _ = serve(lambda h: _redirect(h, f"{other}/simple/fastlib/"))
     pypi.fetch_simple(f"{first}/simple/fastlib/", "Basic abc")
     assert other_seen, "the redirect was not followed"
@@ -337,13 +337,14 @@ def test_flag_beats_config(fake_simple, tmp_path):
     assert fake_simple.calls[0][0].startswith("https://flag.example/simple/")
 
 
-def test_config_index_url_with_credentials_is_never_printed(fake_simple, tmp_path, capsys):
+def test_config_index_url_refuses_credentials(fake_simple, tmp_path, capsys):
     from wheelgap.cli import main
 
-    main([_project(tmp_path, "https://user:s3cret@config.example/simple"), "--json"])
+    # pyproject.toml is committed: a token there would be published with the repo.
+    assert main([_project(tmp_path, "https://user:s3cret@config.example/simple"), "--json"]) == 2
     out = capsys.readouterr()
-    assert fake_simple.calls[0][0] == "https://config.example/simple/fastlib/"
-    assert fake_simple.calls[0][1] is not None  # sent as an auth header, not in the URL
+    assert not fake_simple.calls
+    assert "--index-url" in out.out + out.err
     assert "s3cret" not in out.out + out.err
 
 
@@ -354,3 +355,48 @@ def test_config_index_url_must_be_a_string(tmp_path, capsys):
     (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nindex-url = 5\n")
     assert main([req]) == 2
     assert "index-url" in capsys.readouterr().err
+
+
+# --- Requires-Python, plain http, and the requires-python re-check ---
+
+
+@pytest.mark.parametrize("spec", [">=1", ">=2", "<2"])
+def test_simple_path_matches_json_path_for_a_python(spec, fake_pypi, fake_simple):
+    def shape(p):
+        return (p.version, sorted(p.files) if p.files is not None else None, p.error)
+
+    json_pkg = pypi.fill(Package("pythonranged", None, spec=spec), python="3.9")
+    assert shape(json_pkg) == shape(fill("pythonranged", spec=spec, python="3.9"))
+
+
+def test_range_skips_releases_whose_requires_python_excludes_the_target(fake_simple):
+    assert fill("pythonranged", spec=">=1", python="3.9").version == "1.0"
+    assert fill("pythonranged", spec=">=1", python="3.12").version == "2.0"
+    assert fill("pythonranged", spec=">=2", python="3.9").error == "no release matches >=2 for Python 3.9"
+
+
+def test_fill_all_passes_the_python_to_the_simple_index(fake_simple):
+    pkgs = [Package("pythonranged", None, spec=">=1")]
+    pypi.fill_all(pkgs, python="3.9", simple_index=BASE)
+    assert pkgs[0].version == "1.0"
+
+
+def test_plain_http_is_refused_except_for_localhost():
+    with pytest.raises(SourceError, match="https") as exc:
+        pypi.split_credentials("http://user:s3cret@private.example/simple")
+    assert "s3cret" not in str(exc.value)
+    assert pypi.split_credentials("http://127.0.0.1:8080/simple") == ("http://127.0.0.1:8080/simple", None)
+    assert pypi.split_credentials("http://localhost/simple/")[0] == "http://localhost/simple"
+
+
+def test_recheck_lock_uses_the_simple_index(fake_simple):
+    pkg = Package("fastlib", "2.0.0")
+    pkg.files = []
+    assert pypi.recheck_lock([pkg], simple_index=BASE) == (0, 0)
+    assert fake_simple.calls[0][0] == f"{BASE}/fastlib/"
+    assert pkg.files
+
+
+def test_accept_header_lets_an_html_only_index_answer_with_html():
+    assert pypi.SIMPLE_ACCEPT.startswith(pypi.SIMPLE_JSON + ",")
+    assert "text/html;q=0.01" in pypi.SIMPLE_ACCEPT

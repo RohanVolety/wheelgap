@@ -82,6 +82,8 @@ def _simple_files(name):
             }
             if entry.get("yanked"):
                 item["yanked"] = True  # PEP 592: a bool or a reason string
+            if "requires_python" in entry:
+                item["requires-python"] = entry["requires_python"]  # PEP 691 spelling
             files.append(item)
     return files
 
