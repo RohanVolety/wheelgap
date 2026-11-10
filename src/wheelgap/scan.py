@@ -21,10 +21,10 @@ from . import __version__
 from .api import Result, check_packages
 from .check import Status
 from .pypi import fetch_json
-from .targets import NATIVE_PLATFORMS, PYODIDE_PLATFORMS, Target, build_targets, parse_python
+from .targets import NATIVE_PLATFORMS, PYODIDE_PLATFORMS, Target, TargetError, build_targets, parse_python
 
 TOP_PACKAGES_URL = "https://hugovk.dev/top-pypi-packages/top-pypi-packages.min.json"
-DEFAULT_PYTHONS = "3.13,3.14,3.14t"
+DEFAULT_PYTHONS = "3.13,3.14,3.14t,3.15,3.15t"
 SCHEMA_VERSION = 1
 
 
@@ -37,7 +37,7 @@ def scan_targets(pythons: str) -> list[Target]:
         if not ft and (major, minor) in PYODIDE_PLATFORMS:
             platforms.append("pyodide")
         targets += build_targets([spec], platforms)
-    return targets
+    return list(dict.fromkeys(targets))
 
 
 def load_top(source: str, limit: int) -> tuple[list[dict], str | None]:
@@ -101,12 +101,24 @@ def report(
     }
 
 
+def positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m wheelgap.scan", description=__doc__.splitlines()[0])
-    p.add_argument("--top", type=int, default=5000, metavar="N", help="how many packages to scan (default: 5000)")
+    p.add_argument(
+        "--top", type=positive_int, default=5000, metavar="N", help="how many packages to scan (default: 5000)"
+    )
     p.add_argument("--python", default=DEFAULT_PYTHONS, metavar="VERS", help=f"default: {DEFAULT_PYTHONS}")
     p.add_argument("--top-packages", default=TOP_PACKAGES_URL, metavar="URL_OR_PATH", help="top-pypi-packages JSON")
-    p.add_argument("--workers", type=int, default=16, help="parallel index lookups (default: 16)")
+    p.add_argument("--workers", type=positive_int, default=16, help="parallel index lookups (default: 16)")
     p.add_argument("--out", metavar="PATH", help="write here instead of stdout")
     p.add_argument(
         "--max-error-rate",
@@ -118,7 +130,12 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     started = time.monotonic()
-    targets = scan_targets(args.python)
+    try:
+        targets = scan_targets(args.python)
+    except TargetError as error:
+        p.error(f"argument --python: {error}")
+    if not targets:
+        p.error("argument --python: provide at least one Python version")
     rows, last_update = load_top(args.top_packages, args.top)
     results = scan(rows, targets, args.workers)
     data = report(rows, results, targets, args.top_packages, last_update)

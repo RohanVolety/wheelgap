@@ -3,7 +3,15 @@ import json
 import pytest
 
 from wheelgap.check import Status, check
-from wheelgap.sources import SourceError, find_lockfile, load_inputs, parse_requirements
+from wheelgap.sources import (
+    Source,
+    SourceError,
+    find_lockfile,
+    load_inputs,
+    parse_poetry_lock,
+    parse_requirements,
+    pythons_outside_lock,
+)
 from wheelgap.targets import build_targets
 
 
@@ -57,6 +65,34 @@ def test_pdm_lock(fixtures, input_name):
     assert pkgs["backport"].markers == ["python_version < '3.13'"]
     assert pkgs["localpkg"].skip == "path"
     assert all(p.origin == "pdm.lock" for p in src.packages)
+
+
+def test_pdm_lock_legacy_metadata_files(tmp_path, fake_pypi):
+    path = tmp_path / "pdm.lock"
+    lock = (
+        '[metadata]\nlock_version = "3.0"\n\n'
+        '[[package]]\nname = "oldpkg"\nversion = "1.0"\n\n'
+        '[[package]]\nname = "newpkg"\nversion = "2.0"\n\n'
+        '[[package]]\nname = "jinja2"\nversion = "3.1.2"\n\n'
+        "[metadata.files]\n"
+        '"oldpkg 1.0" = [\n'
+        '    {file = "oldpkg-1.0-py3-none-any.whl", hash = "sha256:00"},\n'
+        "]\n"
+        '"Jinja2 3.1.2" = [\n'
+        '    {url = "https://files.pythonhosted.org/packages/Jinja2-3.1.2-py3-none-any.whl", hash = "sha256:00"},\n'
+        "]\n"
+    )
+    path.write_text(lock, encoding="utf-8")
+    (src,) = load_inputs([str(path)])
+    pkgs = by_name(src)
+    assert pkgs["oldpkg"].files == ["oldpkg-1.0-py3-none-any.whl"]
+    assert pkgs["newpkg"].files is None  # not in metadata.files either: fall back to PyPI
+    assert pkgs["jinja2"].files == ["Jinja2-3.1.2-py3-none-any.whl"]  # normalized-name fallback
+    from wheelgap.pypi import fill_all
+
+    fill_all(src.packages)
+    # Only the package missing from [metadata.files] is looked up on the index.
+    assert fake_pypi and all("/newpkg/" in url for url in fake_pypi)
 
 
 def test_pylock(fixtures):
@@ -163,6 +199,137 @@ def test_no_lockfile_in_dir(fixtures):
 def test_bad_requirement():
     with pytest.raises(SourceError):
         load_inputs(["not a valid ! spec"])
+
+
+def test_requirements_lock(tmp_path):
+    path = tmp_path / "requirements.lock"
+    path.write_text("fastlib==2.0.0\nwinonly==3.11 ; sys_platform == 'win32'\n", encoding="utf-8")
+    (src,) = load_inputs([str(path)])
+    pkgs = by_name(src)
+    assert src.label == "requirements.lock"
+    assert pkgs["fastlib"].version == "2.0.0"
+    assert pkgs["winonly"].markers == ['sys_platform == "win32"']
+
+
+def test_requirements_dev_lock(tmp_path):
+    path = tmp_path / "requirements-dev.lock"
+    path.write_text("pytest==8.3.5\n", encoding="utf-8")
+    (src,) = load_inputs([str(path)])
+    pkgs = by_name(src)
+    assert src.label == "requirements-dev.lock"
+    assert pkgs["pytest"].version == "8.3.5"
+
+
+def test_requirements_uvicorn_lock(tmp_path):
+    path = tmp_path / "requirements-uvicorn.lock"
+    path.write_text("uvicorn==0.34.0\n", encoding="utf-8")
+    (src,) = load_inputs([str(path)])
+    pkgs = by_name(src)
+    assert src.label == "requirements-uvicorn.lock"
+    assert pkgs["uvicorn"].version == "0.34.0"
+
+
+def test_find_lockfile_requirements_lock(tmp_path):
+    (tmp_path / "requirements.lock").write_text("numpy==2.0.0\n", encoding="utf-8")
+    found = find_lockfile(tmp_path)
+    assert found.name == "requirements.lock"
+
+
+def test_pipfile_lock_custom_categories(tmp_path):
+    path = tmp_path / "Pipfile.lock"
+    lock = {
+        "docs": {
+            "sphinx": {"version": "==7.2.6"},
+            "furo": {"version": "==2024.1.29"},
+        },
+        "_meta": {"sources": []},
+        "default": {
+            "requests": {"version": "==2.31.0"},
+            "sphinx": {"version": "==7.2.6"},
+        },
+        "develop": {
+            "pytest": {"version": "==8.0.0"},
+        },
+        "tests": {
+            "pytest-cov": {"version": "==4.1.0"},
+        },
+    }
+    path.write_text(json.dumps(lock), encoding="utf-8")
+    (src,) = load_inputs([str(path)])
+    assert [(p.name, p.version) for p in src.packages] == [
+        ("requests", "2.31.0"),
+        ("sphinx", "7.2.6"),
+        ("pytest", "8.0.0"),
+        ("furo", "2024.1.29"),
+        ("pytest-cov", "4.1.0"),
+    ]
+    assert len(src.packages) == 5
+
+
+def _two_source_pipfile_lock(tmp_path):
+    path = tmp_path / "Pipfile.lock"
+    lock = {
+        "_meta": {
+            "sources": [
+                {"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": True},
+                {"name": "legacy", "url": "https://pypi.python.org/simple", "verify_ssl": True},
+                {"name": "internal", "url": "https://pkgs.example.com/simple", "verify_ssl": True},
+                {"name": "broken", "url": "https://[bad/simple", "verify_ssl": True},
+            ]
+        },
+        "default": {
+            "acme-utils": {"version": "==2.1.0", "index": "internal"},
+            "requests": {"version": "==2.31.0", "index": "pypi"},
+            "six": {"version": "==1.16.0", "index": "legacy"},
+            "fastlib": {"version": "==2.0.0"},
+            "ghost": {"version": "==1.0.0", "index": "not-in-meta"},
+            "oddball": {"version": "==1.0.0", "index": "broken"},
+        },
+    }
+    path.write_text(json.dumps(lock), encoding="utf-8")
+    return path
+
+
+def test_pipfile_lock_private_index_is_skipped(tmp_path):
+    (src,) = load_inputs([str(_two_source_pipfile_lock(tmp_path))])
+    assert [(p.name, p.skip) for p in src.packages] == [
+        ("acme-utils", "private index"),
+        ("requests", None),
+        ("six", None),
+        ("fastlib", None),
+        ("ghost", "private index"),  # an index the lock doesn't describe: can't tell it's PyPI
+        ("oddball", "private index"),  # a URL urlparse rejects: skipped, not a crash
+    ]
+
+
+def test_pipfile_lock_private_index_in_one_category_skips_the_package(tmp_path):
+    # Pipenv writes "index" on direct dependencies: the same package can be direct in develop, transitive in default.
+    path = tmp_path / "Pipfile.lock"
+    lock = {
+        "_meta": {"sources": [{"name": "internal", "url": "https://pkgs.example.com/simple"}]},
+        "default": {"acme-utils": {"version": "==2.1.0"}},
+        "develop": {"acme-utils": {"version": "==2.1.0", "index": "internal"}},
+    }
+    path.write_text(json.dumps(lock), encoding="utf-8")
+    (src,) = load_inputs([str(path)])
+    assert [(p.name, p.skip) for p in src.packages] == [("acme-utils", "private index")]
+
+
+def test_pipfile_lock_malformed_package_entry_raises(tmp_path):
+    path = tmp_path / "Pipfile.lock"
+    lock = {"default": {"requests": "==2.31.0"}}
+    path.write_text(json.dumps(lock), encoding="utf-8")
+    with pytest.raises(SourceError, match="isn't a package entry"):
+        load_inputs([str(path)])
+
+
+@pytest.mark.parametrize("section", ["default", "develop", "docs"])
+@pytest.mark.parametrize("value", [None, [], "x"])
+def test_pipfile_lock_malformed_section_raises(tmp_path, section, value):
+    path = tmp_path / "Pipfile.lock"
+    path.write_text(json.dumps({"_meta": {}, section: value}), encoding="utf-8")
+    with pytest.raises(SourceError, match=f"{section} isn't a package section"):
+        load_inputs([str(path)])
 
 
 def test_pdm_lock_extras_variants_count_once(tmp_path):
@@ -406,3 +573,59 @@ def test_odd_pyproject_never_breaks_a_poetry_run(tmp_path, pyproject):
     )
     (src,) = load_inputs([str(tmp_path)])
     assert [p.name for p in src.packages] == ["x"]
+
+
+@pytest.mark.parametrize(
+    ("requires", "pythons", "outside"),
+    [
+        ("==3.13.*", ["3.13", "3.14t"], ["3.14t"]),
+        (">=3.11.4", ["3.11", "3.12"], []),  # a patch-level floor still serves 3.11
+        (">=3.11, <3.15", ["3.10", "3.14", "3.15"], ["3.10", "3.15"]),
+        (None, ["3.14"], []),
+        ("not a specifier", ["3.14"], []),
+        ("==3.12.4", ["3.12", "3.13"], ["3.13"]),  # a pinned patch still serves its minor
+        (">=3.11,<3.11.5", ["3.11"], []),
+        ("==3.14.0rc2", ["3.14"], []),
+        (">=3.10, !=3.12.*", ["3.12"], []),  # uv only uses the bounds, so 3.12's wheels stay
+    ],
+)
+def test_pythons_outside_lock(requires, pythons, outside):
+    source = Source("uv.lock", requires_python=requires)
+    assert pythons_outside_lock(source, build_targets(pythons, ["linux-x86_64"])) == outside
+
+
+def test_uv_lock_records_requires_python(tmp_path):
+    (tmp_path / "uv.lock").write_text('version = 1\nrequires-python = "==3.13.*"\n', encoding="utf-8")
+    (src,) = load_inputs([str(tmp_path)])
+    assert src.requires_python == "==3.13.*"
+
+
+def test_pylock_records_requires_python_and_index(tmp_path):
+    (tmp_path / "pylock.toml").write_text(
+        'lock-version = "1.0"\nrequires-python = "==3.13.*"\n\n[[packages]]\nname = "fastlib"\nversion = "2.0.0"\n'
+        'index = "https://pypi.org/simple"\n'
+        'wheels = [{ name = "fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl" }]\n',
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path / "pylock.toml")])
+    assert src.requires_python == "==3.13.*" and src.packages[0].registry == "https://pypi.org/simple"
+
+
+def test_pipfile_lock_non_string_version_raises(tmp_path):
+    path = tmp_path / "Pipfile.lock"
+    path.write_text(json.dumps({"default": {"requests": {"version": 2}}}), encoding="utf-8")
+    with pytest.raises(SourceError, match="default.requests has a version that isn't a string"):
+        load_inputs([str(path)])
+
+
+def test_poetry_lock_records_a_legacy_source_as_the_registry(tmp_path):
+    path = tmp_path / "poetry.lock"
+    path.write_text(
+        '[[package]]\nname = "purewheel"\nversion = "3.1"\n'
+        'files = [{file = "purewheel-3.1-cp313-cp313-win_amd64.whl", hash = "sha256:00"}]\n\n'
+        '[package.source]\ntype = "legacy"\nurl = "https://pkgs.example.com/simple"\nreference = "private"\n\n'
+        '[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    (pkg,) = parse_poetry_lock(path).packages
+    assert pkg.registry == "https://pkgs.example.com/simple"

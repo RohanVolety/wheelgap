@@ -12,9 +12,10 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from typing import IO
+from urllib.parse import quote, unquote, urlparse, urlsplit, urlunsplit
 
-from packaging.specifiers import SpecifierSet
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import (
     InvalidSdistFilename,
     InvalidWheelFilename,
@@ -54,19 +55,46 @@ def _retry_after(e: urllib.error.HTTPError) -> float | None:
     return value if value is not None and math.isfinite(value) and value >= 0 else None
 
 
+class RedirectRefused(urllib.error.URLError):
+    """An https:// request was redirected to a URL that isn't https://."""
+
+
+class _HTTPSRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow redirects that downgrade https:// to plain http:// (or another scheme)."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: http.client.HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if urlparse(req.full_url).scheme == "https" and urlparse(newurl).scheme != "https":
+            fp.close()
+            raise RedirectRefused(f"refused redirect from {req.full_url} to {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_HTTPSRedirectHandler)
+
+
 def _request(req: urllib.request.Request, timeout: float, attempts: int, read):
     """Send `req`, retrying only what can succeed later: 429, 5xx and dropped connections."""
     last: Exception | None = None
     for attempt in range(attempts):
         delay = 0.5 * 2**attempt
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _OPENER.open(req, timeout=timeout) as resp:
                 return read(resp)
         except urllib.error.HTTPError as e:
             if e.code != 429 and e.code < 500:
                 raise  # 404, 403, 410...: asking again won't help
             last = e
             delay = _retry_after(e) or delay
+        except RedirectRefused:
+            raise  # asking again gets the same redirect
         except (urllib.error.URLError, TimeoutError, http.client.HTTPException, ConnectionError) as e:
             last = e  # includes connection resets and truncated responses
         if attempt + 1 < attempts:
@@ -204,22 +232,35 @@ def _files(entries: object) -> list[dict]:
     return entries
 
 
-def _newest_matching(data: dict, spec: str) -> tuple[str, list[dict]] | None:
-    """The newest release that matches `spec` and has files that aren't yanked."""
+def _supports_python(entry: dict, python: str | None) -> bool:
+    """Missing or invalid Requires-Python metadata imposes no restriction."""
+    requires = entry.get("requires_python")
+    if python is None or not isinstance(requires, str):
+        return True
+    try:
+        # A real interpreter is on a later patch release than x.y.0 (pip compares sys.version_info[:3]),
+        # so `>=3.8.1` must admit 3.8 and `!=3.9.0` must admit 3.9: compare against a late patch.
+        return SpecifierSet(requires).contains(f"{python}.99")
+    except InvalidSpecifier:
+        return True
+
+
+def _newest_matching(data: dict, spec: str, python: str | None = None) -> tuple[str, list[dict]] | None:
+    """The newest matching release with non-yanked files supporting `python`, when supplied."""
     releases = data.get("releases")
     if not isinstance(releases, dict):
         # A mirror without the (deprecated) release list: fall back to the latest, if it matches.
         info, latest = data.get("info"), None
         if isinstance(info, dict):
             latest = info.get("version")
-        live = [e for e in _files(data.get("urls", [])) if not e.get("yanked")]
+        live = [e for e in _files(data.get("urls", [])) if not e.get("yanked") and _supports_python(e, python)]
         if isinstance(latest, str) and _in_spec(latest, spec) and live:
             return latest, live
         raise ValueError("no release list")  # reported as unknown, not as "can't install"
     usable = {}
     for text, entries in releases.items():
         try:
-            live = [e for e in _files(entries) if not e.get("yanked")]
+            live = [e for e in _files(entries) if not e.get("yanked") and _supports_python(e, python)]
             if live:
                 usable[Version(text)] = (text, live)
         except (InvalidVersion, ValueError):
@@ -248,7 +289,7 @@ def _not_found(base: str, name: str, version: str | None) -> str:
     return "not on index"
 
 
-def fill(pkg: Package) -> Package:
+def fill(pkg: Package, python: str | None = None) -> Package:
     base = index_url()
     name = quote(pkg.key)
     pinned = bool(pkg.version)
@@ -266,9 +307,9 @@ def fill(pkg: Package) -> Package:
             raise ValueError("not an object")
         if not pinned and pkg.spec:
             # A range (numpy>=1.26,<2): check the release an installer would pick, not the latest.
-            found = _newest_matching(data, pkg.spec)
+            found = _newest_matching(data, pkg.spec, python)
             if found is None:
-                pkg.error = f"no release matches {pkg.spec}"
+                pkg.error = f"no release matches {pkg.spec}" + (f" for Python {python}" if python else "")
                 return pkg
             pkg.version, urls = found
         else:
@@ -288,15 +329,61 @@ def fill(pkg: Package) -> Package:
     return pkg
 
 
+PYPI_SIMPLE = "https://pypi.org/simple"
+
+
+def is_pypi(registry: str | None) -> bool:
+    """Whether a package pinned to `registry` comes from PyPI: unset (the default index) or exactly PYPI_SIMPLE."""
+    return (registry or PYPI_SIMPLE).rstrip("/") == PYPI_SIMPLE
+
+
+def keeps_locked_files(p: Package) -> bool:
+    """Under --online, a package from another index keeps the files in the lock: PyPI doesn't know it."""
+    return not p.skip and p.files is not None and not is_pypi(p.registry)
+
+
+def recheck_lock(packages: list[Package]) -> tuple[int, int]:
+    """Add the index's files to lockfile packages whose lock may be missing some (see pythons_outside_lock).
+
+    Only packages the lock says came from PyPI are looked up. The lock's own files are kept, and a package
+    whose lookup fails stays as the lock described it. Returns (packages from other indexes, failed lookups).
+    """
+    locked = [p for p in packages if not p.skip and p.files is not None and p.version]  # pinned: same release
+    todo = [p for p in locked if is_pypi(p.registry)]
+    saved = [p.files or [] for p in todo]
+    fill_all(todo, refresh=True)
+    failed = 0
+    for p, lock in zip(todo, saved, strict=True):
+        if p.error:
+            p.files, p.error = lock, None
+            failed += 1
+        else:
+            p.files = list(dict.fromkeys(lock + (p.files or [])))
+    return len(locked) - len(todo), failed
+
+
 def fill_all(
-    packages: list[Package], refresh: bool = False, workers: int = 16, simple_index: str | None = None
-) -> None:
-    fn = fill
+    packages: list[Package],
+    refresh: bool = False,
+    workers: int = 16,
+    python: str | None = None,
+    simple_index: str | None = None,
+) -> int:
+    """Look packages up on PyPI. A package the lock says came from another index is never looked up: PyPI doesn't
+    know it. With refresh (--online) it keeps its locked files; with no files (an old poetry.lock) it is skipped as
+    a private index. `python` limits range resolution to releases supporting that interpreter.
+    With `simple_index` (--index-url), lookups go to that PEP 691 simple index instead of PyPI's JSON API.
+    Returns how many kept their locked files for that reason."""
+    fn = partial(fill, python=python)
     if simple_index is not None:
-        base, auth = split_credentials(simple_index)
+        base, auth = split_credentials(simple_index)  # validate first: a bad URL fails before any lookup
         fn = partial(fill_simple, base=base, auth=auth)
-    todo = [p for p in packages if not p.skip and (refresh or p.files is None)]
-    if not todo:
-        return
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        list(pool.map(fn, todo))
+    for p in packages:
+        if p.files is None and not p.skip and not is_pypi(p.registry):
+            p.skip = "private index"  # the name is internal; a namesake on PyPI is another package
+    kept = {id(p) for p in packages if refresh and keeps_locked_files(p)}
+    todo = [p for p in packages if not p.skip and id(p) not in kept and (refresh or p.files is None)]
+    if todo:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(fn, todo))
+    return len(kept)

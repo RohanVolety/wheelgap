@@ -1,9 +1,85 @@
 # Changelog
 
 ## Unreleased
-- `--index-url URL` (or `index-url` in `[tool.wheelgap]`) looks packages up in a private index that serves the simple API's JSON form (PEP 691) instead of PyPI's JSON API. It replaces every PyPI lookup; lockfiles that record their files are still read offline unless `--online`. `--index-url` beats the config key, and `WHEELGAP_INDEX_URL` still only sets the base of PyPI's JSON API. Credentials in the URL (`https://user:token@host/simple`) are sent as a Basic auth header and never appear in output, errors or `--json`. An index that only serves HTML (PEP 503) gets a clear error naming its host. (#19)
-- `--markdown` prints the report as Markdown, and the GitHub Action now writes it to the run's summary page (`summary: false` turns that off). The step still passes or fails on the normal run. (#7)
-- New Linux targets for 32-bit ARM (`linux-armv7l`, e.g. Raspberry Pi OS), `ppc64le`, `s390x` and `riscv64`, each with a `musl-*` twin for Alpine, and their Docker names (`linux/arm/v7` and so on) in `-t` and `--dockerfile`. Plain `linux_armv7l` wheels, which PyPI allows for the Raspberry Pi, count on `linux-armv7l` as they do for pip, but not on `musl-armv7l`: they're glibc builds. `-t all` still means the eight common platforms; `-t everything` adds these. (#8)
+- `--index-url URL` (or `index-url` in `[tool.wheelgap]`) looks packages up in a private index that serves the simple API's JSON form (PEP 691) instead of PyPI's JSON API. It replaces every PyPI lookup; lockfiles that record their files are still read offline unless `--online`. `--index-url` beats the config key, and `WHEELGAP_INDEX_URL` still only sets the base of PyPI's JSON API. Credentials in the URL (`https://user:token@host/simple`) are sent as a Basic auth header and never appear in output, errors or `--json`. An index that only serves HTML (PEP 503) gets a clear error naming its host. 
+- `--ignore` (and `ignore = [...]` in `[tool.wheelgap]`) now prints a note on stderr when a name matches no package in any input, so a typo or a stale entry no longer hides silently. `-q` hides it; the exit code is unchanged. (#158, thanks [@bouhafara](https://github.com/bouhafara))
+- Show which targets have gaps in the text summary when checking multiple targets. (#157, thanks [@jwalith4418-Mj](https://github.com/jwalith4418-Mj))
+- Version ranges now select the newest matching release whose non-yanked files support the target's Python through `Requires-Python`, when all targets share one Python major/minor version. A target Python such as `3.8` counts as a current 3.8.x, so `>=3.8.1` admits it. Missing or invalid metadata remains unrestricted; runs checking different Python versions keep the existing selection behavior. (#156, thanks [@Swarneil1905](https://github.com/Swarneil1905))
+- Packages from a private index that the lock has no file list for (an old-format `poetry.lock`, which keeps hashes under `[metadata.hashes]`) are listed as skipped instead of being looked up on public PyPI by name, so internal package names aren't sent to pypi.org. (#153, thanks [@bfs2021](https://github.com/bfs2021))
+- Projects with `[tool.uv] required-environments` are now checked for the native targets those markers select, instead of the built-in defaults, when no targets are set by `-t`, `--dockerfile` or `[tool.wheelgap]`. Inferred targets are explained on stderr; Linux markers include both glibc and musl. Add `[tool.wheelgap] targets` or `-t` to check other targets too; markers that match no native target keep the defaults, with a note. (#150, thanks [@Swarneil1905](https://github.com/Swarneil1905))
+- `--dockerfile` says when an official python image isn't published for the `--platform` asked for, instead of checking a target Docker can't pull: `FROM --platform=linux/riscv64 python:3.13-bookworm` is now an error (`... isn't published for linux/riscv64 (3.13-trixie is)`), as are s390x on current `bookworm` tags and ppc64le or s390x on current `bullseye` tags. Patch tags and the end-of-life tags that were still built for those arches are accepted. (#143, thanks [@sarankumar1325](https://github.com/sarankumar1325))
+- `--offline` never contacts an index, for CI and coding agents without network: an input that needs a lookup (a requirements file, `Pipfile.lock`, package names, lockfile entries with no file list) exits 2 with an error naming the packages (as does a `--pyodide-lock` URL), and the `requires-python` re-check is skipped with a note that those Pythons may show false gaps. It can't be combined with `--online`. (#140, thanks [@sarankumar1325](https://github.com/sarankumar1325))
+
+## 0.8.0 (2026-11-10)
+
+Name the distro you deploy to: `--distro ubuntu-22.04` (or `distro = "..."` in `[tool.wheelgap]`) sets the glibc or musl version for Ubuntu, Debian, RHEL, Rocky, Alma, Amazon Linux and Alpine. `--dockerfile` now gets the glibc right for `python:3.13` and `python:3.13-slim`, whose tags name no Debian release. Packages from a private index are no longer looked up on public PyPI, either in `Pipfile.lock` or under `--online`. With `--json`, input errors are also printed as JSON on stdout. Also new: the [check-wheels skill](https://github.com/wheelgap/wheelgap/tree/main/integrations) for coding agents (Claude Code plugin, Agent Skills and a Cursor rule).
+
+- Set the glibc or musl version by distro name with `--distro` or `distro` in `[tool.wheelgap]`, without changing the selected platforms. Explicit libc flags still win; `--list-targets` lists the supported distros. (#138, thanks [@Swarneil1905](https://github.com/Swarneil1905))
+- `Pipfile.lock` packages pinned to a private index (an `index` whose source URL isn't on pypi.org or pypi.python.org, or isn't listed in `_meta.sources`; a PyPI mirror counts as private too) are listed as skipped instead of being looked up on public PyPI, so internal package names aren't sent to pypi.org. (#136, thanks [@sarankumar1325](https://github.com/sarankumar1325))
+- With `--json`, an input error (a missing lockfile, an unknown target, a bad `[tool.wheelgap]` value) is now also printed on stdout as `{"error": {"message": ..., "type": ...}}`, so scripts and agents don't have to parse stderr. The stderr line and exit code 2 are unchanged. (#137, thanks [@sarankumar1325](https://github.com/sarankumar1325))
+- `--dockerfile` reads an official python `X.Y` image whose tag names no Debian release (`python:3.13`, `python:3.13-slim`) as the release Docker Hub builds it on: trixie (glibc 2.41) for Python 3.9 and later and the release its images stopped on for older ones (bullseye, glibc 2.31, for 3.6), so `manylinux_2_39`/`manylinux_2_41` wheels are no longer reported as source builds there. As for tagged images, this beats `glibc` in `[tool.wheelgap]` (`--glibc` still wins). Patch tags like `python:3.12.7-slim` can still be on an older release, so they keep the `--glibc` default. Pin `-bookworm` or `-trixie` for an answer that doesn't change. (#135, thanks [@sarankumar1325](https://github.com/sarankumar1325))
+- `--online` no longer looks up packages from a private index on public PyPI: only packages whose lockfile index is PyPI are re-checked, the rest keep their locked files, and a note says how many. `poetry.lock` packages now record their source index too. (#133, thanks [@Niranjan-cyber](https://github.com/Niranjan-cyber))
+
+## 0.7.0 (2026-11-09)
+
+Accept known gaps without hiding them: `--ignore NAME`, or `ignore = [...]` in `[tool.wheelgap]`, takes a package out of the table, the counts and the exit code, and lists it as ignored in every output format. Also new: a [recipes page](https://github.com/wheelgap/wheelgap/blob/main/docs/recipes.md) (#123, thanks [@moelomda](https://github.com/moelomda)) and [AGENTS.md](https://github.com/wheelgap/wheelgap/blob/main/AGENTS.md) for coding agents working on wheelgap.
+
+- `--ignore NAME` accepts known package gaps without failing CI, and lists ignored packages in text, JSON and Markdown reports. Repeat the flag or separate names with commas. (#119, thanks [@moelomda](https://github.com/moelomda))
+- Set `ignore = ["psycopg2"]` in `[tool.wheelgap]` to ignore accepted gaps by default. Command-line `--ignore` flags replace this list. (#122, thanks [@moelomda](https://github.com/moelomda))
+
+## 0.6.3 (2026-11-09)
+
+`--dockerfile` now reads Dockerfiles the way Docker does, down to whitespace, line endings, tags and stage names, so it errors where Docker would instead of guessing. The coverage scanner adds Python 3.15 and 3.15t, and `--list-targets` shows the glibc 2.17 manylinux floor outside x86.
+
+- The coverage scanner checks Python 3.15 and free-threaded 3.15t by default, alongside 3.13, 3.14 and 3.14t. (#117, thanks [@moelomda](https://github.com/moelomda))
+- `--dockerfile` accepts quoted `--platform` values such as `FROM --platform="linux/arm64" python:3.13` (and rejects an unterminated quote). (#101, thanks [@Mr45401](https://github.com/Mr45401))
+- `--list-targets` shows the glibc 2.17 floor for non-x86 Linux targets (e.g. `glibc 2.17 to 2.36` for `linux-aarch64`), and the README targets table says so too. A `Pipfile.lock` or `pyodide-lock.json` that isn't a JSON object, or a Pipfile.lock entry with a non-string version, is now a clear error instead of an `AttributeError`. With `-q`, the lock note added in 0.6.2 only appears when some packages couldn't be re-checked. (#99)
+
+### Fixed
+
+- `--dockerfile` rejects an upper-case repository name (`FROM PYTHON:3.13`) or tag variant (`python:3.13-SLIM`) instead of lowercasing it, and a tag with characters Docker doesn't allow, as Docker does. Python versions are matched with ASCII digits only, so `FROM python:3.1٣` and `-p 3.1٣` are errors instead of being read as 3.13. (#108, thanks [@bfs2021](https://github.com/bfs2021))
+- `--dockerfile` splits lines on `\n` only, matching Docker: a lone `\r` (old Mac line endings), NEL and other Unicode line breaks no longer start a new line. CRLF files still work. (#106, thanks [@chiragjangiir](https://github.com/chiragjangiir))
+- `--dockerfile` splits `FROM` lines on ASCII whitespace only, matching Docker, so a non-breaking space (e.g. after `FROM` or between words) is an error instead of quietly splitting words. A Dockerfile that isn't UTF-8 now gets a clear error. (#103, thanks [@chiragjangiir](https://github.com/chiragjangiir))
+- `--dockerfile` rejects stage names Docker rejects (e.g. `AS 1build` or `AS my@stage`) instead of accepting them. (#100, thanks [@chiragjangiir](https://github.com/chiragjangiir))
+
+## 0.6.2 (2026-11-09)
+
+More accurate answers: no false gaps from narrowly locked `uv.lock` and `pylock.toml` files, pip's real manylinux floor on ARM and other non-x86 Linux, stricter Dockerfile parsing, and safer fetching.
+
+### Fixed
+
+- A `uv.lock` or `pylock.toml` whose `requires-python` leaves out the Python being checked (e.g. `==3.13.*` with `-p 3.14t`) no longer reports false gaps. uv keeps only the wheels that can serve `requires-python`, so wheelgap now also looks up the lock's PyPI packages on the index (keeping the lock's files if a lookup fails) and prints a note. (#97)
+- `linux-aarch64`, `linux-armv7l`, `linux-ppc64le`, `linux-s390x` and `linux-riscv64` no longer accept `manylinux` wheels older than glibc 2.17 (e.g. `manylinux_2_12_aarch64`), matching pip: those arches had no manylinux before manylinux2014. (#92, thanks [@shounakjoshi88-a11y](https://github.com/shounakjoshi88-a11y))
+- `--dockerfile` rejects `FROM` lines that Docker rejects instead of reading a target from them: `--platform` without `=`, a repeated `--platform`, unknown flags, and anything other than `IMAGE` or `IMAGE AS NAME` (e.g. `AS` with no name). (#88, thanks [@Vansh300901](https://github.com/Vansh300901))
+- An `https://` lookup (PyPI or `--pyodide-lock`) no longer follows a redirect to plain `http://`; it fails with an error naming both URLs. (#95, thanks [@Mr45401](https://github.com/Mr45401))
+
+## 0.6.1 (2026-11-09)
+
+Two more lockfile formats, and safer `--pyodide-lock` fetching.
+
+- Read Rye and uv requirements lockfiles (`requirements.lock`, `requirements-dev.lock`), and the pre-commit hook runs when they change. (#61, thanks [@chiragjangiir](https://github.com/chiragjangiir))
+- Read custom package categories in `Pipfile.lock` (such as `[docs]` or `[tests]`), not just `default` and `develop`. (#59, thanks [@chiragjangiir](https://github.com/chiragjangiir))
+
+### Fixed
+
+- `--pyodide-lock` refuses plain `http://` URLs (a lockfile fetched without TLS could be changed to mark anything as bundled), names the URL when a fetch fails, and no longer counts test bundles such as `aiohttp-tests` (shipped as `.tar` files, not wheels) as bundled packages. (#68, thanks [@SatriaBagusNurhadianto](https://github.com/SatriaBagusNurhadianto))
+- A malformed `Pipfile.lock` (a section or package entry that isn't a JSON object) is now a clear error naming it, instead of an `AttributeError`. (#59, thanks [@chiragjangiir](https://github.com/chiragjangiir))
+- The summary line says "1 of 1 package", not "1 of 1 packages". (#81, thanks [@HarshRajSinghania](https://github.com/HarshRajSinghania))
+
+## 0.6.0 (2026-11-09)
+
+New targets for phones and more Linux hardware, and a job summary for the GitHub Action.
+
+- iOS and Android targets (PEP 730 / PEP 738): `ios-arm64`, `ios-simulator-arm64`, `ios-simulator-x86_64`, `android-arm64` and `android-x86_64`, all at once with `-t mobile`. `--ios` and `--android-api` (or `ios` and `android-api` in `[tool.wheelgap]`) set the minimum versions, 13.0 and API level 24 by default. Like Pyodide, mobile installs only use wheels, and they need Python 3.13+. (#77)
+- New Linux targets for 32-bit ARM (`linux-armv7l`, e.g. Raspberry Pi OS), `ppc64le`, `s390x` and `riscv64`, each with a `musl-*` twin for Alpine, and their Docker names (`linux/arm/v7` and so on) in `-t` and `--dockerfile`. Plain `linux_armv7l` wheels, which PyPI allows for the Raspberry Pi, count on `linux-armv7l` as they do for pip, but not on `musl-armv7l`: they're glibc builds. `-t all` still means the eight common platforms; `-t everything` adds these. (#72)
+- `--markdown` prints the report as Markdown, and the GitHub Action now writes it to the run's summary page (`summary: false` turns that off). The step still passes or fails on the normal run. (#74)
+- `--dockerfile` follows named stages: with `FROM python:3.13-alpine AS base` and later `FROM base AS runtime`, the final stage is checked as `python:3.13-alpine`, through any chain of stages, keeping the platform that stage was built for (as Docker does). A name that's neither an earlier stage nor a python image gets a clear error. Line continuations now follow Docker's rules (blank and comment lines inside one, `# escape=`), and Python `from ... import` lines in heredocs are no longer mistaken for `FROM`. (#73)
+- Read package files from the `[metadata.files]` table in older `pdm.lock` files (PDM before 2.8) instead of looking them up on PyPI. (#67, thanks [@nxxis](https://github.com/nxxis))
+
+### Fixed
+
+- The scanner rejects invalid arguments before fetching data and lists each Python target once. `check_package()` and `check_packages()` raise `ValueError` for an empty target list instead of reporting no gaps, and empty Python input to `make_targets()` uses the running interpreter. (#78, thanks [@Daiyuanranfeng](https://github.com/Daiyuanranfeng))
+- Out-of-range versions for `--glibc`, `--musl` and `--macos` (e.g. `2.3000000`, which never finished) are now errors, as is an out-of-range `--ios`. (#77)
 
 ## 0.5.0 (2026-11-09)
 

@@ -3,5 +3,5 @@
   description: Find dependencies with no prebuilt wheel for your target platforms.
   entry: wheelgap
   language: python
-  files: (^|/)(uv\.lock|poetry\.lock|pdm\.lock|pylock\.toml|Pipfile\.lock|requirements[^/]*\.txt)$
+  files: (^|/)(uv\.lock|poetry\.lock|pdm\.lock|pylock\.toml|Pipfile\.lock|requirements[^/]*\.(txt|lock))$
   pass_filenames: false

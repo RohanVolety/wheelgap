@@ -29,6 +29,12 @@ def test_rejection_reasons():
     assert rejection("x-1-cp313-cp313-manylinux_2_39_aarch64.whl", target(plat="linux-aarch64")) == (
         "manylinux_2_39_aarch64 needs glibc 2.39, newer than 2.36 (--glibc)"
     )
+    assert rejection("x-1-cp313-cp313-manylinux_2_12_aarch64.whl", target(plat="linux-aarch64")) == (
+        "manylinux_2_12_aarch64 is older than glibc 2.17, the oldest pip accepts on aarch64"
+    )
+    assert rejection("x-1-cp313-cp313-manylinux2010_aarch64.whl", target(plat="linux-aarch64")) == (
+        "manylinux2010_aarch64 is older than glibc 2.17, the oldest pip accepts on aarch64"
+    )
     assert rejection("x-1-cp313-cp313-macosx_15_0_arm64.whl", target(plat="macos-arm64")) == (
         "macosx_15_0_arm64 needs macOS 15.0, newer than 14.0 (--macos)"
     )

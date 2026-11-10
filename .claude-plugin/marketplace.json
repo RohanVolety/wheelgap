@@ -1,0 +1,15 @@
+{
+  "name": "wheelgap",
+  "owner": {
+    "name": "wheelgap",
+    "url": "https://github.com/wheelgap"
+  },
+  "description": "wheelgap's skills for coding agents: check a Python project's dependencies for missing prebuilt wheels.",
+  "plugins": [
+    {
+      "name": "wheelgap",
+      "source": "./integrations/claude-code",
+      "description": "Check whether a Python project's dependencies have prebuilt wheels for the platforms it ships to, with wheelgap."
+    }
+  ]
+}

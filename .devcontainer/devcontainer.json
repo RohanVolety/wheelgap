@@ -1,0 +1,12 @@
+{
+  // For GitHub Codespaces and cloud coding agents: a Python container with uv and the dev tools ready.
+  // Then run the checks in AGENTS.md.
+  "name": "wheelgap",
+  "image": "mcr.microsoft.com/devcontainers/python:3.13",
+  "postCreateCommand": "pipx install uv && uv sync --group dev",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "charliermarsh.ruff"]
+    }
+  }
+}

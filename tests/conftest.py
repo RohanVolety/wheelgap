@@ -16,6 +16,10 @@ FAKE_INDEX = {
         "1.9": ["ranged-1.9.tar.gz"],
         "2.0": ["ranged-2.0-py3-none-any.whl"],
     },
+    "pythonranged": {
+        "1.0": [{"filename": "pythonranged-1.0-py3-none-any.whl", "requires_python": ">=3.8"}],
+        "2.0": [{"filename": "pythonranged-2.0-py3-none-any.whl", "requires_python": ">=3.10"}],
+    },
     "yanked": {"1.0": [{"filename": "yanked-1.0-py3-none-any.whl", "yanked": True}]},
     "halfyanked": {"2.0": [{"filename": "halfyanked-2.0-py3-none-any.whl", "yanked": True}, "halfyanked-2.0.tar.gz"]},
 }

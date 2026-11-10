@@ -5,14 +5,29 @@ from __future__ import annotations
 import json
 import re
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
+from packaging.version import Version
 
-LOCKFILES = ("uv.lock", "pylock.toml", "poetry.lock", "pdm.lock", "Pipfile.lock", "requirements.txt")
+if TYPE_CHECKING:
+    from .targets import Target
+
+LOCKFILES = (
+    "uv.lock",
+    "pylock.toml",
+    "poetry.lock",
+    "pdm.lock",
+    "Pipfile.lock",
+    "requirements.txt",
+    "requirements.lock",
+)
 
 
 class SourceError(ValueError):
@@ -35,6 +50,8 @@ class Package:
     spec: str | None = None
     # Files of a pinned release that the index marks as yanked (see check.status_for).
     yanked: frozenset[str] = frozenset()
+    # uv.lock / pylock.toml / poetry.lock: the index the lock says the package came from, e.g. https://pypi.org/simple.
+    registry: str | None = None
 
     @property
     def key(self) -> str:
@@ -56,6 +73,36 @@ class Source:
     root_edges: list[Edge] = field(default_factory=list)
     # Index into root_edges -> name of the dependency group it comes from, e.g. {0: "dev"}.
     root_groups: dict[int, str] = field(default_factory=dict)
+    # uv.lock only: the project's requires-python. uv keeps only the wheels that can serve it.
+    requires_python: str | None = None
+
+
+def pythons_outside_lock(source: Source, targets: Iterable[Target]) -> list[str]:
+    """Target Pythons the lockfile's requires-python leaves out, e.g. ['3.14t'] for `==3.13.*`.
+
+    uv keeps only the wheels that can serve requires-python (abi3 and pure wheels survive), so the lock may
+    be missing wheels for those Pythons. Like uv, only the bounds count: `!=3.12.*` doesn't exclude 3.12.
+    """
+    if not source.requires_python:
+        return []
+    try:
+        spec = SpecifierSet(",".join(str(s) for s in SpecifierSet(source.requires_python) if s.operator != "!="))
+    except InvalidSpecifier:
+        return []
+    out = []
+    for t in targets:
+        # A minor is served if any of its releases fits: its first and last patch, or a version the spec names.
+        tries = [Version(f"{t.major}.{t.minor}.0"), Version(f"{t.major}.{t.minor}.999")]
+        for s in spec:
+            try:
+                v = Version(s.version.removesuffix(".*"))
+            except ValueError:
+                continue
+            if v.release[:2] == (t.major, t.minor):
+                tries.append(v)
+        if not any(spec.contains(v, prereleases=True) for v in tries):
+            out.append(t.python)
+    return list(dict.fromkeys(out))
 
 
 def _filename(entry: dict) -> str | None:
@@ -91,6 +138,7 @@ def parse_uv_lock(path: Path) -> Source:
         if kind and "registry" not in src:
             pkg.skip = kind
         else:
+            pkg.registry = src.get("registry")
             files = [f for f in (_filename(w) for w in p.get("wheels", [])) if f]
             if p.get("sdist"):
                 files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
@@ -109,6 +157,8 @@ def parse_uv_lock(path: Path) -> Source:
     source.root_edges.extend((d["name"], None, d.get("marker")) for d in manifest.get("requirements", []))
     if not source.roots and not source.root_edges:
         source.edges = None  # no idea where the graph starts; treat every package as needed
+    if isinstance(data.get("requires-python"), str):
+        source.requires_python = data["requires-python"]
     return source
 
 
@@ -116,7 +166,7 @@ def parse_pylock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     pkgs = []
     for p in data.get("packages", []):
-        pkg = Package(p["name"], p.get("version"), origin=path.name)
+        pkg = Package(p["name"], p.get("version"), origin=path.name, registry=p.get("index"))
         if p.get("marker"):
             pkg.markers = [p["marker"]]
         if any(k in p for k in ("vcs", "directory", "archive")) and "wheels" not in p and "sdist" not in p:
@@ -127,7 +177,8 @@ def parse_pylock(path: Path) -> Source:
                 files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
             pkg.files = files
         pkgs.append(pkg)
-    return Source(path.name, pkgs)
+    requires = data.get("requires-python")
+    return Source(path.name, pkgs, requires_python=requires if isinstance(requires, str) else None)
 
 
 def _poetry_edges(p: dict) -> list[Edge]:
@@ -161,10 +212,14 @@ def parse_poetry_lock(path: Path) -> Source:
         if src_type in ("git", "hg", "svn", "bzr", "directory", "file", "url"):
             pkg.skip = src_type
         else:
+            # A "legacy" source is a simple index: remember it so the package isn't looked up on PyPI.
+            url = p.get("source", {}).get("url")
+            pkg.registry = url if isinstance(url, str) else None
             entries = p.get("files")
             if entries is None:
                 entries = legacy_files.get(p["name"])
-            # No files recorded at all (old [metadata.hashes] locks): leave them for the index lookup.
+            # No files recorded at all (old [metadata.hashes] locks): PyPI packages are looked up on the index,
+            # packages from another index are skipped (fill_all).
             pkg.files = None if entries is None else [f for f in (_filename(e) for e in entries) if f]
         edges[len(pkgs)] = _poetry_edges(p)
         pkgs.append(pkg)
@@ -281,20 +336,25 @@ def _version_tuple(text: str) -> tuple[int, ...]:
 def _add_once(pkgs: list[Package], seen: dict[tuple[str, str | None], Package], pkg: Package) -> None:
     """Append `pkg` unless the same name and version is already there; then widen that entry's markers.
 
-    Pipenv lists a package used by both default and develop in both, and PDM writes one entry per
-    extras variant (`coverage` and `coverage[toml]`). Either way it's one install, needed if any entry is.
+    Pipenv lists a package used by several categories (default, develop, docs...) in each of them, and PDM
+    writes one entry per extras variant (`coverage` and `coverage[toml]`). Either way it's one install,
+    needed if any entry is.
     """
     key = (pkg.key, pkg.version)
     first = seen.get(key)
     if first is None:
         seen[key] = pkg
         pkgs.append(pkg)
-    elif first.markers is not None:
+        return
+    if pkg.skip == "private index":
+        first.skip = pkg.skip  # Pipenv may pin the index in one category only: keep the name off pypi.org anyway
+    if first.markers is not None:
         first.markers = None if pkg.markers is None else first.markers + pkg.markers
 
 
 def parse_pdm_lock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
+    legacy_files = data.get("metadata", {}).get("files", {})
     pkgs: list[Package] = []
     seen: dict[tuple[str, str | None], Package] = {}
     for p in data.get("package", []):
@@ -304,28 +364,72 @@ def parse_pdm_lock(path: Path) -> Source:
         src_type = next((k for k in ("git", "hg", "svn", "bzr", "path", "url", "file") if k in p), None)
         if src_type:
             pkg.skip = src_type
-        elif "files" in p:
-            pkg.files = [f for f in (_filename(e) for e in p["files"]) if f]
-        # No files list at all: leave files as None so the PyPI lookup fills them in.
+        else:
+            entries = p.get("files")
+            if entries is None:
+                # Older lockfiles (PDM before 2.8) keep files in one [metadata.files] table
+                # keyed by "name version", with the name as PDM wrote it, which isn't always
+                # normalized ("Jinja2 3.1.2" for jinja2): try the exact key, then match names.
+                entries = legacy_files.get(f"{p['name']} {p.get('version')}")
+                if entries is None:
+                    target_name = canonicalize_name(p["name"])
+                    target_version = p.get("version")
+                    for key, value in legacy_files.items():
+                        key_name, _, key_version = key.rpartition(" ")
+                        if key_version == target_version and canonicalize_name(key_name) == target_name:
+                            entries = value
+                            break
+            if entries is not None:
+                pkg.files = [f for f in (_filename(e) for e in entries) if f]
+            # Not in either place: leave files as None so the PyPI lookup fills them in.
         _add_once(pkgs, seen, pkg)
     return Source(path.name, pkgs)
 
 
 def parse_pipfile_lock(path: Path) -> Source:
     data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SourceError(f"{path.name}: not a Pipfile.lock (expected a JSON object)")
     pkgs: list[Package] = []
     seen: dict[tuple[str, str | None], Package] = {}
-    for section in ("default", "develop"):
-        for name, p in data.get(section, {}).items():
+    for key, val in data.items():
+        if key != "_meta" and not isinstance(val, dict):
+            raise SourceError(f"{path.name}: {key} isn't a package section")
+    sections = [s for s in ("default", "develop") if s in data]
+    sections += [key for key in data if key not in ("_meta", "default", "develop")]
+    meta = data.get("_meta")
+    sources = meta.get("sources") if isinstance(meta, dict) else None
+    # Pipenv writes "index": "<source name>" for a package pinned to one of the Pipfile's [[source]] entries.
+    source_urls = {
+        s["name"]: s["url"]
+        for s in (sources if isinstance(sources, list) else [])
+        if isinstance(s, dict) and isinstance(s.get("name"), str) and isinstance(s.get("url"), str)
+    }
+    for section in sections:
+        for name, p in data[section].items():
+            if not isinstance(p, dict):
+                raise SourceError(f"{path.name}: {section}.{name} isn't a package entry")
             version = p.get("version")
+            if version is not None and not isinstance(version, str):
+                raise SourceError(f"{path.name}: {section}.{name} has a version that isn't a string")
             pkg = Package(name, version.removeprefix("==") if version else None, origin=path.name)
             if p.get("markers"):
                 pkg.markers = [p["markers"]]
             pkg.skip = next((kind for kind in ("git", "hg", "svn", "bzr", "path", "file") if kind in p), None)
             if pkg.skip is None and p.get("editable"):
                 pkg.skip = "editable"
+            index = p.get("index")
+            if pkg.skip is None and index is not None and not _is_public_pypi(source_urls.get(str(index))):
+                pkg.skip = "private index"  # don't send internal names to pypi.org, or check a namesake there
             _add_once(pkgs, seen, pkg)
     return Source(path.name, pkgs)
+
+
+def _is_public_pypi(url: str | None) -> bool:
+    try:
+        return url is not None and urlparse(url).hostname in ("pypi.org", "pypi.python.org")
+    except ValueError:  # e.g. "https://[bad/simple": not something we can call PyPI
+        return False
 
 
 def _pinned_version(req: Requirement) -> str | None:
@@ -411,13 +515,15 @@ def load_file(path: Path) -> Source:
         return PARSERS[name](path)
     if name.startswith("pylock.") and name.endswith(".toml"):
         return parse_pylock(path)
+    if name.startswith("requirements") and name.endswith(".lock"):
+        return parse_requirements(path)
     if name.endswith(".lock") and "uv" in name:
         return parse_uv_lock(path)
     if name.endswith((".txt", ".in")):
         return parse_requirements(path)
     raise SourceError(
         f"don't know how to read {path} "
-        "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock or requirements.txt)"
+        "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, requirements.lock or requirements.txt)"
     )
 
 

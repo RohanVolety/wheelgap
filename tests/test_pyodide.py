@@ -1,4 +1,5 @@
 import json
+import urllib.error
 
 import pytest
 
@@ -21,7 +22,8 @@ def run(capsys, *argv):
 def test_parse_keeps_only_packages_by_canonical_name(lock):
     parsed = load_pyodide_lock(lock)
     assert parsed.python == (3, 13) and parsed.abi == "2025_0" and parsed.pyodide_version == "0.29.0"
-    assert parsed.packages == {"fastlib": "2.0.0", "markupsafe": "3.0.2"}  # no cpython_module / shared_library
+    # no cpython_module / shared_library, and no test bundle (fastlib-tests ships as a .tar)
+    assert parsed.packages == {"fastlib": "2.0.0", "markupsafe": "3.0.2"}
 
 
 def test_bundled_package_counts_as_available(capsys, fake_pypi, lock):
@@ -103,11 +105,62 @@ def test_url_is_fetched(capsys, fake_pypi, lock, monkeypatch):
     assert code == 0
 
 
+@pytest.mark.parametrize("url", ["http://cdn.example/pyodide-lock.json", "HTTP://cdn.example/pyodide-lock.json"])
+def test_plain_http_url_is_refused(monkeypatch, url):
+    def fetch_json(url, timeout=20.0):
+        raise AssertionError("must not fetch over plain http")
+
+    monkeypatch.setattr(pypi, "fetch_json", fetch_json)
+    with pytest.raises(PyodideLockError, match="plain http:// URLs are not allowed"):
+        load_pyodide_lock(url)
+
+
+def test_upper_case_https_url_is_fetched(lock, monkeypatch):
+    lock_data = json.loads(open(lock).read())
+    monkeypatch.setattr(pypi, "fetch_json", lambda url, timeout=20.0: lock_data)
+    assert load_pyodide_lock("HTTPS://cdn.example/pyodide-lock.json").python == (3, 13)
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (urllib.error.HTTPError("u", 404, "Not Found", None, None), "HTTP 404"),
+        (urllib.error.URLError("no route"), "no route"),
+        (ValueError("bad JSON"), "bad JSON"),
+    ],
+)
+def test_failed_fetch_names_the_url(monkeypatch, error, message):
+    def fetch_json(url, timeout=20.0):
+        raise error
+
+    monkeypatch.setattr(pypi, "fetch_json", fetch_json)
+    url = "https://cdn.example/pyodide-lock.json"
+    with pytest.raises(PyodideLockError, match=f"couldn't fetch {url}: {message}"):
+        load_pyodide_lock(url)
+
+
+def test_unexpected_errors_are_not_reported_as_fetch_failures(monkeypatch):
+    def fetch_json(url, timeout=20.0):
+        raise TypeError("a bug")
+
+    monkeypatch.setattr(pypi, "fetch_json", fetch_json)
+    with pytest.raises(TypeError):
+        load_pyodide_lock("https://cdn.example/pyodide-lock.json")
+
+
 def test_lock_from_pyproject(capsys, fake_pypi, lock, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "pyproject.toml").write_text(f'[tool.wheelgap]\npyodide-lock = "{lock}"\n'.replace("\\", "/"))
     code, out, _ = run(capsys, "fastlib==2.0.0", "-p", "3.13", "-t", "pyodide")
     assert code == 0
+
+
+@pytest.mark.parametrize("scheme", ["http", "HTTP"])
+def test_plain_http_lock_from_pyproject_is_refused(capsys, fake_pypi, tmp_path, monkeypatch, scheme):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(f'[tool.wheelgap]\npyodide-lock = "{scheme}://cdn.example/lock.json"\n')
+    code, _, err = run(capsys, "fastlib==2.0.0", "-p", "3.13", "-t", "pyodide")
+    assert code == 2 and "plain http:// URLs are not allowed" in err
 
 
 def test_failed_lookup_is_not_bundled(capsys, fake_pypi, lock):
@@ -158,3 +211,10 @@ def test_lock_from_pyproject_for_another_python_is_an_error(capsys, fake_pypi, l
 def test_lock_covering_only_some_pyodide_targets_warns(capsys, fake_pypi, lock):
     code, out, err = run(capsys, "fastlib==2.0.0", "-p", "3.12,3.13", "-t", "pyodide", "--pyodide-lock", lock)
     assert "pyodide results for Python 3.12 don't include packages that Pyodide bundles" in err
+
+
+def test_lock_that_is_not_a_json_object(tmp_path):
+    bad = tmp_path / "pyodide-lock.json"
+    bad.write_text("[]")
+    with pytest.raises(PyodideLockError, match="not a pyodide-lock.json"):
+        load_pyodide_lock(str(bad))

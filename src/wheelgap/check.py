@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover
     _Value = _Variable = None  # type: ignore[assignment,misc]
 
 from .sources import Edge, Package, Source
-from .targets import PLATFORMS, Target
+from .targets import ANDROID_FLOOR, IOS_FLOOR, MANYLINUX_FLOOR, MANYLINUX_X86_ARCHES, PLATFORMS, Target
 
 
 class Status(StrEnum):
@@ -116,12 +116,26 @@ _LIBC = {"manylinux": "glibc", "musllinux": "musl", "macosx": "macOS"}
 
 
 _WASM_RE = re.compile(r"^(?:pyodide|pyemscripten|emscripten)_[0-9_]+_wasm32$")
+_IOS_RE = re.compile(r"^ios_(\d+)_(\d+)_(.+)$")
+_ANDROID_RE = re.compile(r"^android_(\d+)_(.+)$")
 
 
 def _platform_reason(plat: str, target: Target) -> str:
     family, arch = PLATFORMS[target.platform]
     if family == "pyodide" and _WASM_RE.match(plat):
         return f"{plat} is for a different Pyodide ABI than Python {target.python}"
+    if family == "ios" and (m := _IOS_RE.match(plat)) and m.group(3) == arch:
+        need = (int(m.group(1)), int(m.group(2)))
+        have = ".".join(map(str, target.ios))
+        if need < IOS_FLOOR:
+            return f"{plat} is older than iOS 12.0, the oldest pip accepts"
+        if need > target.ios:
+            return f"{plat} needs iOS {need[0]}.{need[1]}, newer than {have} (--ios)"
+        return f"{plat} isn't one of the iOS versions pip tries for {have} (x.0 to x.9 of each older release)"
+    if family == "android" and (m := _ANDROID_RE.match(plat)) and m.group(2) == arch:
+        if int(m.group(1)) < ANDROID_FLOOR:
+            return f"{plat} is older than API level {ANDROID_FLOOR}, the oldest pip accepts"
+        return f"{plat} needs Android API level {m.group(1)}, newer than {target.android_api} (--android-api)"
     m = _PLAT_RE.match(plat)
     if m:
         kind, major, minor, wheel_arch = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
@@ -137,6 +151,15 @@ def _platform_reason(plat: str, target: Target) -> str:
         return f"{plat} is a glibc wheel; musl (Alpine) needs musllinux"
     if same_arch and kind == "musllinux" and family == "manylinux":
         return f"{plat} is a musl wheel; glibc Linux needs manylinux"
+    if (
+        same_arch
+        and kind == "manylinux"
+        and family == "manylinux"
+        and major == MANYLINUX_FLOOR[0]
+        and arch not in MANYLINUX_X86_ARCHES
+        and minor < MANYLINUX_FLOOR[1]
+    ):
+        return f"{plat} is older than glibc {MANYLINUX_FLOOR[0]}.{MANYLINUX_FLOOR[1]}, the oldest pip accepts on {arch}"
     ceiling = {"manylinux": target.glibc, "musllinux": target.musl, "macosx": target.macos}[kind]
     same_family = kind == family or (kind == "macosx" and family == "macos")
     if same_arch and same_family and major and (major, minor) > ceiling:
@@ -179,6 +202,8 @@ _OS_PREFIX: dict[str, tuple[str, ...]] = {
     "macos": ("macosx",),
     "windows": ("win",),
     "pyodide": ("pyodide_", "pyemscripten_", "emscripten_"),
+    "ios": ("ios_",),
+    "android": ("android_",),
 }
 
 

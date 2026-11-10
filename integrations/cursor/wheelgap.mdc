@@ -1,0 +1,12 @@
+---
+description: Check Python dependencies for missing prebuilt wheels (ARM, Alpine/musl, Windows on ARM, free-threaded Python) with wheelgap, when a build compiles packages from source ("Failed building wheel for", "Microsoft Visual C++ 14.0 is required") or the user asks whether dependencies will install on a platform.
+alwaysApply: false
+---
+
+- Run `uvx wheelgap@latest -p <the project's Python> -t <platforms> --json` in the project directory, e.g. `-p 3.13 -t linux-aarch64,musl-aarch64`. Always pass `-p` (without it wheelgap may check free-threaded 3.14t). Or take both from a Dockerfile with `--dockerfile Dockerfile`. `uvx wheelgap@latest --list-targets` lists targets.
+- It finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt` or `requirements.lock`; pass other files by path.
+- If the user names a deployment distro, pass `--distro NAME` (e.g. `ubuntu-22.04`, `alpine`; `--list-targets` lists them), or for one that isn't listed, verify its libc version and pass `--glibc X.Y` or `--musl X.Y`. None of these select platforms, so Alpine still needs a `musl-*` target.
+- Read `summary.with_gaps` and each package's `results` (target label from `targets[].label` → `wheel`, `source`, `missing`, `unknown`, `n/a` or `bundled`), not just the exit code (`0`/`1` gaps/`2` bad input). `skipped` lists packages that weren't checked.
+- Treat `unknown` as a failed lookup (see the package's `error`), not as fine. `--explain` adds why each wheel was rejected (`rejected`) and, for `uv.lock`, which dependency pulls it in (`via`).
+- Suggest fixes: pin a version that has the wheel, use a `-slim` base instead of Alpine, or add build dependencies deliberately. Accept a known gap with `--ignore NAME` (or `ignore = [...]` in `[tool.wheelgap]`), never by hiding it.
+- wheelgap reports wheel availability only, not free-threading safety.

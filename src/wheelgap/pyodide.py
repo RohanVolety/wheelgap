@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import sys
+import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +35,8 @@ class PyodideLock:
 
 
 def parse_pyodide_lock(data: dict, source: str) -> PyodideLock:
+    if not isinstance(data, dict):
+        raise PyodideLockError(f"{source}: not a pyodide-lock.json (expected a JSON object)")
     info = data.get("info")
     packages = data.get("packages")
     if not isinstance(info, dict) or not isinstance(packages, dict):
@@ -48,18 +52,34 @@ def parse_pyodide_lock(data: dict, source: str) -> PyodideLock:
     bundled = {
         str(canonicalize_name(p["name"])): str(p["version"])
         for p in packages.values()
-        # Also listed: CPython stdlib modules, shared libraries and test bundles, which aren't PyPI packages.
-        if isinstance(p, dict) and p.get("package_type", "package") == "package" and "name" in p and "version" in p
+        # Only real installable wheels. CPython stdlib modules and shared libraries
+        # are filtered by package_type; test bundles (aiohttp-tests, ...) ship as
+        # .tar/.zip and aren't installable distributions.
+        if isinstance(p, dict)
+        and p.get("package_type", "package") == "package"
+        and ("file_name" not in p or str(p["file_name"]).lower().endswith(".whl"))
+        and "name" in p
+        and "version" in p
     }
     return PyodideLock(source, str(info.get("version", "?")), (major, minor), abi, bundled)
 
 
 def load_pyodide_lock(spec: str) -> PyodideLock:
-    """Read a pyodide-lock.json from a path, or fetch it when given an http(s) URL."""
-    if spec.startswith(("http://", "https://")):
+    """Read a pyodide-lock.json from a path, or fetch it when given an https:// URL."""
+    scheme = spec.split("://", 1)[0].lower() if "://" in spec else ""
+    if scheme == "http":
+        raise PyodideLockError(f"{spec}: plain http:// URLs are not allowed; use https://")
+    if scheme == "https":
         from .pypi import fetch_json
 
-        data = fetch_json(spec)
+        try:
+            data = fetch_json(spec)
+        except urllib.error.HTTPError as e:
+            raise PyodideLockError(f"couldn't fetch {spec}: HTTP {e.code}") from None
+        except urllib.error.URLError as e:
+            raise PyodideLockError(f"couldn't fetch {spec}: {e.reason}") from None
+        except (OSError, http.client.HTTPException, ValueError) as e:
+            raise PyodideLockError(f"couldn't fetch {spec}: {e}") from None
     else:
         try:
             data = json.loads(Path(spec).read_text(encoding="utf-8"))

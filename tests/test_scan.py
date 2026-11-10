@@ -1,6 +1,8 @@
 import json
 
-from wheelgap.scan import main, scan_targets
+import pytest
+
+from wheelgap.scan import DEFAULT_PYTHONS, main, scan_targets
 
 
 def write_top(tmp_path, names):
@@ -18,10 +20,45 @@ def test_scan_targets_add_pyodide_only_where_it_exists():
     assert sum(1 for x in labels if x.startswith("3.14t ")) == 8
 
 
+def test_scan_targets_removes_duplicate_versions_in_order():
+    assert scan_targets("3.14t,3.13,cp314t,3.13") == scan_targets("3.14t,3.13")
+
+
+def test_scan_defaults_include_python_315(fake_pypi, tmp_path, capsys):
+    top = write_top(tmp_path, ["purewheel"])
+    assert main(["--top-packages", str(top)]) == 0
+    labels = [target["label"] for target in json.loads(capsys.readouterr().out)["targets"]]
+    assert labels == [target.label(True) for target in scan_targets(DEFAULT_PYTHONS)]
+    for version in ("3.13", "3.14", "3.14t", "3.15", "3.15t"):
+        assert f"{version} linux-x86_64" in labels
+    assert "3.15 pyodide" not in labels
+    assert "3.15t pyodide" not in labels
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--top", "-5", "must be a positive integer"),
+        ("--top", "0", "must be a positive integer"),
+        ("--workers", "0", "must be a positive integer"),
+        ("--workers", "-1", "must be a positive integer"),
+        ("--top", "1.5", "must be a positive integer"),
+        ("--workers", "abc", "must be a positive integer"),
+        ("--python", " , ", "provide at least one Python version"),
+        ("--python", "invalid", "can't parse Python version"),
+    ],
+)
+def test_scan_rejects_invalid_arguments_before_loading_data(tmp_path, capsys, flag, value, message):
+    with pytest.raises(SystemExit) as error:
+        main([flag, value, "--top-packages", str(tmp_path / "missing.json")])
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
+
+
 def test_scan_writes_the_tracker_data(fake_pypi, tmp_path, capsys):
     top = write_top(tmp_path, ["purewheel", "fastlib", "nowheels", "does-not-exist"])
     out = tmp_path / "coverage.json"
-    assert main(["--top", "3", "--python", "3.13", "--top-packages", str(top), "--out", str(out)]) == 0
+    assert main(["--top", "3", "--python", "3.13,cp313", "--top-packages", str(top), "--out", str(out)]) == 0
     data = json.loads(out.read_text())
 
     assert data["schema"] == 1

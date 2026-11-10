@@ -26,7 +26,28 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      - run: uv run --python ${{ matrix.python }} --group dev pytest -v
+      - name: pytest
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run --python ${{ matrix.python }} --group dev pytest -v -rfE 2>&1 | tee pytest.log
+      # On failure, put the failing tests on the run's summary page, so people (and agents) don't have to dig through the log.
+      - name: Summarise failures
+        if: failure()
+        shell: bash
+        run: |
+          [ -f pytest.log ] || exit 0  # failed before pytest ran: the log says why
+          {
+            echo "### Failed tests (${{ matrix.os }}, Python ${{ matrix.python }})"
+            echo
+            echo '```'
+            if grep -q 'short test summary info' pytest.log; then
+              sed -n '/short test summary info/,$p' pytest.log | tail -n 60
+            else
+              tail -n 60 pytest.log
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   lint:
     runs-on: ubuntu-latest
@@ -35,8 +56,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      - run: uv run --group dev ruff check .
-      - run: uv run --group dev ruff format --check .
+      - run: uv run --group dev ruff check --output-format=github .
+      - run: uv run --group dev ruff format --check --diff .
       - run: uv run --group dev mypy
 
   dogfood:
