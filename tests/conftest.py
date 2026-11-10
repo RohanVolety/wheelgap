@@ -63,3 +63,52 @@ def fake_pypi(monkeypatch):
 
     monkeypatch.setattr(pypi, "fetch_json", fetch_json)
     return calls
+
+
+def _simple_files(name):
+    """Every file of every version in one flat list, like a PEP 691 project page."""
+    files = []
+    for fs in FAKE_INDEX[name].values():
+        for f in fs:
+            entry = f if isinstance(f, dict) else {"filename": f}
+            item = {
+                "filename": entry["filename"],
+                "url": f"https://files.example/{entry['filename']}",
+                "hashes": {},
+            }
+            if entry.get("yanked"):
+                item["yanked"] = True  # PEP 592: a bool or a reason string
+            files.append(item)
+    return files
+
+
+class FakeSimple:
+    """A fake PEP 691 index: .calls records requests, .html_only makes it serve only PEP 503 HTML."""
+
+    def __init__(self):
+        self.calls = []  # (url, auth) pairs
+        self.html_only = False
+
+
+@pytest.fixture
+def fake_simple(monkeypatch):
+    import urllib.error
+    from urllib.parse import urlsplit
+
+    from wheelgap import pypi
+
+    index = FakeSimple()
+
+    def fetch_simple(url, auth=None, timeout=20.0):
+        # Credentials must be split off before the fetch layer (they go in `auth`).
+        assert "@" not in urlsplit(url).netloc, "credentials leaked into the request URL"
+        index.calls.append((url, auth))
+        if index.html_only:
+            raise pypi.IndexFormatError(urlsplit(url).hostname or "index")
+        name = url.rstrip("/").rsplit("/", 1)[-1]
+        if name not in FAKE_INDEX:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        return {"meta": {"api-version": "1.0"}, "name": name, "files": _simple_files(name)}
+
+    monkeypatch.setattr(pypi, "fetch_simple", fetch_simple)
+    return index

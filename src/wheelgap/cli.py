@@ -15,7 +15,7 @@ from .api import running_python
 from .check import Row, Status, check, explain, has_sdist
 from .dockerfile import DockerfileError, read_dockerfile
 from .pyodide import PyodideLock, PyodideLockError, apply_bundled, check_targets, load_pyodide_lock
-from .pypi import check_index_url, fill_all
+from .pypi import check_index_url, fill_all, split_credentials
 from .sources import Package, SourceError, load_inputs
 from .targets import (
     ALIASES,
@@ -131,6 +131,13 @@ def make_parser() -> argparse.ArgumentParser:
         choices=FAIL_ON,
         help="exit 1 on any gap ('source', the default) or only when a package can't install ('missing')",
     )
+    p.add_argument(
+        "--index-url",
+        metavar="URL",
+        help="look packages up in this simple index (PEP 691 JSON) instead of PyPI's JSON API "
+        "(lockfiles that list their files are still read offline unless --online); "
+        "credentials can go in the URL (https://user:token@host/simple)",
+    )
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     p.add_argument("--list-targets", action="store_true", help="list platforms, aliases and compatibility limits")
     p.add_argument("-V", "--version", action="version", version=f"wheelgap {__version__}")
@@ -139,7 +146,7 @@ def make_parser() -> argparse.ArgumentParser:
 
 FAIL_ON = ("source", "missing")
 LIST_KEYS = ("python", "targets")
-STR_KEYS = ("glibc", "musl", "macos", "fail-on", "pyodide-lock")
+STR_KEYS = ("glibc", "musl", "macos", "fail-on", "pyodide-lock", "index-url")
 
 
 def project_dir(inputs: list[str]) -> Path:
@@ -541,7 +548,11 @@ def main(argv: list[str] | None = None) -> int:
             args.musl or config.get("musl", DEFAULT_MUSL),
             args.macos or config.get("macos", DEFAULT_MACOS),
         )
-        check_index_url()
+        index_url = args.index_url if args.index_url is not None else config.get("index-url")
+        if index_url is not None:
+            split_credentials(index_url)
+        else:
+            check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
         sources = load_inputs(args.inputs or ["."])
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None
@@ -563,7 +574,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     packages = [p for s in sources for p in s.packages]
-    fill_all(packages, refresh=args.online)
+    fill_all(packages, refresh=args.online, simple_index=index_url)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
     if pyodide_lock:
